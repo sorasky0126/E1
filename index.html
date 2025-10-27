@@ -1,0 +1,625 @@
+// Cloudflare Worker - index.js
+addEventListener('fetch', event => {
+  event.respondWith(handleRequest(event.request));
+});
+
+const HTML = `<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>地震震度予測システム（Worker配信）</title>
+<link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+<style>
+  body { font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; }
+  /* 簡易スイッチ用 */
+  .switch { width: 44px; height: 24px; background: #d1d5db; border-radius: 999px; position: relative; display:inline-block; vertical-align: middle; }
+  .switch > .knob { width:20px;height:20px;background:#fff;border-radius:999px;position:absolute;left:2px;top:2px;transition: all .2s;box-shadow:0 1px 3px rgba(0,0,0,.2); }
+  .switch.on{background:#2563eb;}
+  .switch.on > .knob{transform: translateX(20px);}
+</style>
+</head>
+<body class="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
+  <div class="max-w-7xl mx-auto">
+    <div class="bg-white rounded-lg shadow-xl p-6 mb-6">
+      <div class="flex items-center gap-3 mb-4">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="none"><path d="M12 2v20" stroke="#ef4444" stroke-width="2" stroke-linecap="round"/></svg>
+        <h1 class="text-3xl font-bold text-gray-800">高精度地震震度予測システム</h1>
+      </div>
+      <p class="text-gray-600 mb-4">GeoJSON を使った、47都道府県の震度分布シミュレーション（クライアント描画）</p>
+    </div>
+
+    <div class="grid lg:grid-cols-3 gap-6 mb-6">
+      <div class="bg-white rounded-lg shadow-lg p-6">
+        <h2 class="text-xl font-bold mb-3">震源と観測点</h2>
+
+        <div class="space-y-4">
+          <div>
+            <label class="block text-sm text-gray-700">マグニチュード: <span id="magLabel">7.0</span></label>
+            <input id="magnitude" type="range" min="4.0" max="9.0" step="0.1" value="7.0" class="w-full">
+          </div>
+
+          <div>
+            <label class="block text-sm text-gray-700">震源深さ (km): <span id="depthLabel">10</span></label>
+            <input id="depth" type="range" min="0" max="100" step="1" value="10" class="w-full">
+          </div>
+
+          <div class="grid grid-cols-2 gap-2">
+            <div>
+              <label class="block text-sm text-gray-700">観測点 緯度</label>
+              <input id="targetLat" type="number" step="0.01" value="35.7" class="w-full px-2 py-1 border rounded text-sm">
+            </div>
+            <div>
+              <label class="block text-sm text-gray-700">観測点 経度</label>
+              <input id="targetLon" type="number" step="0.01" value="139.7" class="w-full px-2 py-1 border rounded text-sm">
+            </div>
+          </div>
+
+          <div>
+            <label class="block text-sm text-gray-700">震源 緯度</label>
+            <input id="epicenterLat" type="number" step="0.01" value="35.6895" class="w-full px-2 py-1 border rounded text-sm">
+          </div>
+          <div>
+            <label class="block text-sm text-gray-700">震源 経度</label>
+            <input id="epicenterLon" type="number" step="0.01" value="139.6917" class="w-full px-2 py-1 border rounded text-sm">
+          </div>
+
+          <div>
+            <div class="flex items-center justify-between">
+              <div>
+                <div class="text-sm text-gray-700">地層データ自動計算</div>
+              </div>
+              <div>
+                <div id="autoSwitch" class="switch on"><div class="knob"></div></div>
+              </div>
+            </div>
+            <div class="bg-green-50 p-3 rounded-md text-sm mt-2">
+              <div class="text-green-800 font-medium">地質: <span id="geology">計算中...</span></div>
+              <div class="text-green-800">AVS30: <span id="avs30">300</span> m/s</div>
+              <div class="text-green-800">増幅率: <span id="amp">1.6</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="predictionCard" class="bg-white rounded-lg shadow-lg p-6 hidden">
+        <h2 class="text-xl font-bold mb-4">地点予測結果</h2>
+        <div id="predictedBox" class="rounded-lg p-6 text-center mb-4"></div>
+        <div class="space-y-2 text-sm">
+          <div class="flex justify-between">
+            <span class="text-gray-600">震央距離:</span>
+            <span id="surfDist" class="font-semibold"></span>
+          </div>
+          <div class="flex justify-between">
+            <span class="text-gray-600">予測PGV:</span>
+            <span id="pgvVal" class="font-semibold"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="bg-white rounded-lg shadow-xl p-6 mb-6">
+      <div class="flex justify-between items-center mb-4">
+        <h2 class="text-2xl font-bold">日本地図 震度分布シミュレーション</h2>
+        <div class="flex gap-2 items-center">
+          <select id="simSpeed" class="px-3 py-2 border rounded text-sm">
+            <option value="1">1倍速</option>
+            <option value="2">2倍速</option>
+            <option value="5">5倍速</option>
+            <option value="10">10倍速</option>
+          </select>
+          <button id="startBtn" class="px-4 py-2 bg-blue-600 text-white rounded">開始</button>
+          <button id="stopBtn" class="px-4 py-2 bg-yellow-600 text-white rounded hidden">停止</button>
+          <button id="resetBtn" class="px-4 py-2 bg-gray-600 text-white rounded">リセット</button>
+        </div>
+      </div>
+
+      <div class="bg-gray-100 rounded-lg p-4 mb-4">
+        <div class="flex justify-between">
+          <span class="text-lg font-semibold">経過時間: <span id="simTime">0.0</span>秒</span>
+          <span class="text-sm text-gray-600">到達地域数: <span id="reachedCount">0</span> / 47</span>
+        </div>
+      </div>
+
+      <div class="relative bg-white rounded-lg p-4 border border-gray-300">
+        <div id="loadingMap" class="flex items-center justify-center h-96">
+          <div class="text-center">
+            <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
+            <p class="text-gray-600">地図データを読み込み中...</p>
+          </div>
+        </div>
+        <svg id="mapSvg" viewBox="0 0 850 680" class="w-full h-auto hidden" style="max-height:800px"></svg>
+      </div>
+
+      <div class="grid md:grid-cols-2 gap-4 mt-4">
+        <div class="bg-gray-50 rounded-lg p-4">
+          <h3 class="font-bold mb-2">到達済み地域（到達順）</h3>
+          <div id="reachedList" class="space-y-1 max-h-64 overflow-y-auto text-xs"></div>
+        </div>
+
+        <div class="bg-gray-50 rounded-lg p-4">
+          <h3 class="font-bold mb-2">震度凡例</h3>
+          <div class="grid grid-cols-2 gap-2 text-sm">
+            <div class="flex items-center gap-2 p-2 bg-white rounded"><div style="width:18px;height:18px;background:#C0C0C0"></div><span>震度0</span></div>
+            <div class="flex items-center gap-2 p-2 bg-white rounded"><div style="width:18px;height:18px;background:#3B82F6"></div><span>震度1</span></div>
+            <div class="flex items-center gap-2 p-2 bg-white rounded"><div style="width:18px;height:18px;background:#10B981"></div><span>震度2</span></div>
+            <div class="flex items-center gap-2 p-2 bg-white rounded"><div style="width:18px;height:18px;background:#FBBF24"></div><span>震度3</span></div>
+            <div class="flex items-center gap-2 p-2 bg-white rounded"><div style="width:18px;height:18px;background:#F97316"></div><span>震度4</span></div>
+            <div class="flex items-center gap-2 p-2 bg-white rounded"><div style="width:18px;height:18px;background:#EF4444"></div><span>震度5弱</span></div>
+            <div class="flex items-center gap-2 p-2 bg-white rounded"><div style="width:18px;height:18px;background:#DC2626"></div><span>震度5強</span></div>
+            <div class="flex items-center gap-2 p-2 bg-white rounded"><div style="width:18px;height:18px;background:#B91C1C"></div><span>震度6弱</span></div>
+            <div class="flex items-center gap-2 p-2 bg-white rounded"><div style="width:18px;height:18px;background:#991B1B"></div><span>震度6強</span></div>
+            <div class="flex items-center gap-2 p-2 bg-white rounded"><div style="width:18px;height:18px;background:#7C3AED"></div><span>震度7</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="bg-white rounded-lg shadow-lg p-6">
+      <h3 class="text-lg font-bold mb-3">データソースと計算手法</h3>
+      <div class="text-sm text-gray-600">GeoJSON（GitHub）を用いた描画、AVS30 に基づく増幅率、距離減衰式、到達時間計算など。</div>
+    </div>
+  </div>
+
+  <!-- D3 を CDN から読み込み -->
+  <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+
+  <script>
+  (function(){
+    // ---- 都道府県の県庁所在地データ（元コードと同じ） ----
+    const prefectures = [
+      { code: 1, name: '北海道', city: '札幌', lat: 43.0642, lon: 141.3469 },
+      { code: 2, name: '青森県', city: '青森', lat: 40.8244, lon: 140.7400 },
+      { code: 3, name: '岩手県', city: '盛岡', lat: 39.7036, lon: 141.1527 },
+      { code: 4, name: '宮城県', city: '仙台', lat: 38.2682, lon: 140.8694 },
+      { code: 5, name: '秋田県', city: '秋田', lat: 39.7186, lon: 140.1024 },
+      { code: 6, name: '山形県', city: '山形', lat: 38.2404, lon: 140.3633 },
+      { code: 7, name: '福島県', city: '福島', lat: 37.7503, lon: 140.4676 },
+      { code: 8, name: '茨城県', city: '水戸', lat: 36.3418, lon: 140.4468 },
+      { code: 9, name: '栃木県', city: '宇都宮', lat: 36.5658, lon: 139.8836 },
+      { code: 10, name: '群馬県', city: '前橋', lat: 36.3911, lon: 139.0608 },
+      { code: 11, name: '埼玉県', city: 'さいたま', lat: 35.8617, lon: 139.6455 },
+      { code: 12, name: '千葉県', city: '千葉', lat: 35.6074, lon: 140.1065 },
+      { code: 13, name: '東京都', city: '東京', lat: 35.6895, lon: 139.6917 },
+      { code: 14, name: '神奈川県', city: '横浜', lat: 35.4437, lon: 139.6380 },
+      { code: 15, name: '新潟県', city: '新潟', lat: 37.9026, lon: 139.0232 },
+      { code: 16, name: '富山県', city: '富山', lat: 36.6953, lon: 137.2113 },
+      { code: 17, name: '石川県', city: '金沢', lat: 36.5946, lon: 136.6256 },
+      { code: 18, name: '福井県', city: '福井', lat: 36.0652, lon: 136.2216 },
+      { code: 19, name: '山梨県', city: '甲府', lat: 35.6642, lon: 138.5684 },
+      { code: 20, name: '長野県', city: '長野', lat: 36.6513, lon: 138.1810 },
+      { code: 21, name: '岐阜県', city: '岐阜', lat: 35.3912, lon: 136.7223 },
+      { code: 22, name: '静岡県', city: '静岡', lat: 34.9769, lon: 138.3831 },
+      { code: 23, name: '愛知県', city: '名古屋', lat: 35.1815, lon: 136.9066 },
+      { code: 24, name: '三重県', city: '津', lat: 34.7303, lon: 136.5086 },
+      { code: 25, name: '滋賀県', city: '大津', lat: 35.0045, lon: 135.8686 },
+      { code: 26, name: '京都府', city: '京都', lat: 35.0116, lon: 135.7681 },
+      { code: 27, name: '大阪府', city: '大阪', lat: 34.6937, lon: 135.5023 },
+      { code: 28, name: '兵庫県', city: '神戸', lat: 34.6901, lon: 135.1955 },
+      { code: 29, name: '奈良県', city: '奈良', lat: 34.6851, lon: 135.8329 },
+      { code: 30, name: '和歌山県', city: '和歌山', lat: 34.2261, lon: 135.1675 },
+      { code: 31, name: '鳥取県', city: '鳥取', lat: 35.5014, lon: 134.2382 },
+      { code: 32, name: '島根県', city: '松江', lat: 35.4723, lon: 133.0505 },
+      { code: 33, name: '岡山県', city: '岡山', lat: 34.6617, lon: 133.9350 },
+      { code: 34, name: '広島県', city: '広島', lat: 34.3965, lon: 132.4596 },
+      { code: 35, name: '山口県', city: '山口', lat: 34.1861, lon: 131.4706 },
+      { code: 36, name: '徳島県', city: '徳島', lat: 34.0658, lon: 134.5594 },
+      { code: 37, name: '香川県', city: '高松', lat: 34.3401, lon: 134.0434 },
+      { code: 38, name: '愛媛県', city: '松山', lat: 33.8416, lon: 132.7657 },
+      { code: 39, name: '高知県', city: '高知', lat: 33.5597, lon: 133.5311 },
+      { code: 40, name: '福岡県', city: '福岡', lat: 33.6064, lon: 130.4181 },
+      { code: 41, name: '佐賀県', city: '佐賀', lat: 33.2494, lon: 130.2988 },
+      { code: 42, name: '長崎県', city: '長崎', lat: 32.7503, lon: 129.8777 },
+      { code: 43, name: '熊本県', city: '熊本', lat: 32.7898, lon: 130.7417 },
+      { code: 44, name: '大分県', city: '大分', lat: 33.2382, lon: 131.6126 },
+      { code: 45, name: '宮崎県', city: '宮崎', lat: 31.9077, lon: 131.4202 },
+      { code: 46, name: '鹿児島県', city: '鹿児島', lat: 31.5602, lon: 130.5581 },
+      { code: 47, name: '沖縄県', city: '那覇', lat: 26.2124, lon: 127.6809 }
+    ];
+
+    // ---- DOM 要素取得 ----
+    const magnitudeEl = document.getElementById('magnitude');
+    const depthEl = document.getElementById('depth');
+    const magLabel = document.getElementById('magLabel');
+    const depthLabel = document.getElementById('depthLabel');
+    const targetLatEl = document.getElementById('targetLat');
+    const targetLonEl = document.getElementById('targetLon');
+    const epicenterLatEl = document.getElementById('epicenterLat');
+    const epicenterLonEl = document.getElementById('epicenterLon');
+    const geologyEl = document.getElementById('geology');
+    const avs30El = document.getElementById('avs30');
+    const ampEl = document.getElementById('amp');
+    const predictedCard = document.getElementById('predictionCard');
+    const predictedBox = document.getElementById('predictedBox');
+    const surfDistEl = document.getElementById('surfDist');
+    const pgvEl = document.getElementById('pgvVal');
+
+    const svg = d3.select('#mapSvg');
+    const loadingMap = document.getElementById('loadingMap');
+    const simTimeEl = document.getElementById('simTime');
+    const reachedCountEl = document.getElementById('reachedCount');
+    const reachedListEl = document.getElementById('reachedList');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const resetBtn = document.getElementById('resetBtn');
+    const simSpeedEl = document.getElementById('simSpeed');
+    const autoSwitch = document.getElementById('autoSwitch');
+
+    // 状態
+    let magnitude = parseFloat(magnitudeEl.value);
+    let depth = parseFloat(depthEl.value);
+    let epicenterLat = parseFloat(epicenterLatEl.value);
+    let epicenterLon = parseFloat(epicenterLonEl.value);
+    let targetLat = parseFloat(targetLatEl.value);
+    let targetLon = parseFloat(targetLonEl.value);
+    let amplificationFactor = 1.6;
+    let autoAmplification = true;
+    let avs30 = 300;
+    let geologyType = '計算中...';
+    let prefectureIntensities = {};
+    let japanData = null;
+    let isSimulating = false;
+    let simStartTime = null;
+    let animationId = null;
+
+    // 色スケール
+    function getIntensityColor(scale) {
+      const colors = {
+        '0': '#C0C0C0', '1': '#3B82F6', '2': '#10B981',
+        '3': '#FBBF24', '4': '#F97316', '5弱': '#EF4444',
+        '5強': '#DC2626', '6弱': '#B91C1C', '6強': '#991B1B', '7': '#7C3AED'
+      };
+      return colors[scale] || '#C0C0C0';
+    }
+
+    function getIntensityScale(intensity) {
+      if (intensity < 0.5) return '0';
+      if (intensity < 1.5) return '1';
+      if (intensity < 2.5) return '2';
+      if (intensity < 3.5) return '3';
+      if (intensity < 4.5) return '4';
+      if (intensity < 5.0) return '5弱';
+      if (intensity < 5.5) return '5強';
+      if (intensity < 6.0) return '6弱';
+      if (intensity < 6.5) return '6強';
+      return '7';
+    }
+
+    function calculateAmplificationFromAVS30(avs30Value){
+      if (avs30Value >= 400) return 1.0;
+      const amp = Math.pow(400 / avs30Value, 0.6);
+      return Math.min(amp, 3.0);
+    }
+
+    function estimateAVS30FromLocation(lat, lon){
+      const isCoastalLowland = (lat < 36 && lon > 139.5 && lon < 140.5) ||
+                                (lat > 34 && lat < 35 && lon > 135 && lon < 136) ||
+                                (lat < 34 && lon > 130 && lon < 132);
+      const isAlluvialPlain = (lat > 35 && lat < 37 && lon > 138.5 && lon < 140) ||
+                              (lat > 33 && lat < 34 && lon > 130 && lon < 131);
+      const isDiluvialPlateau = (lat > 35.5 && lat < 36.5 && lon > 139 && lon < 140.5);
+      const isMountainous = (lat > 36 && lon < 138) || (lat > 35 && lon > 141);
+
+      if (isCoastalLowland) return { avs30: 180, type: '沖積低地（軟弱）' };
+      if (isAlluvialPlain) return { avs30: 220, type: '沖積平野' };
+      if (isDiluvialPlateau) return { avs30: 280, type: '洪積台地' };
+      if (isMountainous) return { avs30: 450, type: '丘陵・山地（硬質）' };
+      return { avs30: 300, type: '第三紀丘陵' };
+    }
+
+    function toRad(deg) { return deg * Math.PI / 180; }
+    function calculateDistance(lat1, lon1, lat2, lon2) {
+      const latAvg = (lat1 + lat2) / 2;
+      const a = 6378137, b = 6356752.314245;
+      const e2 = (a*a - b*b) / (a*a);
+      const W = Math.sqrt(1 - e2 * Math.sin(toRad(latAvg))**2);
+      const M = (a * (1 - e2)) / (W**3);
+      const N = a / W;
+      const dLat = toRad(lat2 - lat1);
+      const dLon = toRad(lon2 - lon1);
+      const distance = Math.sqrt((M * dLat)**2 + (N * Math.cos(toRad(latAvg)) * dLon)**2);
+      return distance / 1000;
+    }
+
+    function calculateHypocentralDistance(surfaceDistance, depth){
+      return Math.sqrt(surfaceDistance**2 + depth**2);
+    }
+
+    function calculateSWaveArrivalTime(distance, depth, targetAvs30){
+      const hypoDistance = calculateHypocentralDistance(distance, depth);
+      const crustVs = 3.5;
+      const surfaceThickness = 0.03;
+      const surfaceVs = targetAvs30 / 1000;
+      const surfaceTime = surfaceThickness / surfaceVs;
+      const crustTime = (hypoDistance - surfaceThickness) / crustVs;
+      return crustTime + surfaceTime;
+    }
+
+    function predictPGV(M, X, depth){
+      const Mw = M;
+      const D = X;
+      const depthFactor = 0.0038 * depth;
+      const logPGV = 0.58 * Mw + depthFactor - 1.29 - Math.log10(D + 0.0028 * Math.pow(10, 0.5 * Mw)) - 0.002 * D;
+      return Math.pow(10, logPGV);
+    }
+
+    function pgvToIntensity(pgv, amplification){
+      const adjustedPGV = pgv * amplification;
+      const I = 2.68 + 1.72 * Math.log10(Math.max(adjustedPGV, 1e-6));
+      return Math.max(0, I);
+    }
+
+    // UI 更新
+    function updatePredictionCard(pred) {
+      if (!pred) { predictedCard.classList.add('hidden'); return; }
+      predictedCard.classList.remove('hidden');
+      const color = getIntensityColor(pred.scale);
+      predictedBox.style.backgroundColor = color + '20';
+      predictedBox.innerHTML = '<div class="text-6xl font-bold" style="color:'+color+'">'+pred.scale+'</div>' +
+        '<p class="text-sm text-gray-600 mt-2">計測震度: '+pred.value.toFixed(2)+'</p>';
+      surfDistEl.textContent = pred.surfaceDistance.toFixed(1) + ' km';
+      pgvEl.textContent = pred.pgv.toFixed(1) + ' cm/s';
+    }
+
+    function computePointPrediction(){
+      const surfaceDist = calculateDistance(epicenterLat, epicenterLon, targetLat, targetLon);
+      const hypoDist = calculateHypocentralDistance(surfaceDist, depth);
+      const pgv = predictPGV(magnitude, hypoDist, depth);
+      const intensity = pgvToIntensity(pgv, amplificationFactor);
+      return { value: intensity, scale: getIntensityScale(intensity), pgv, surfaceDistance: surfaceDist, hypoDistance: hypoDist };
+    }
+
+    // GeoJSON 読み込み（複数ソースを試す。失敗時は簡易円でフォールバック）
+    async function loadJapanGeo() {
+      const sources = [
+        'https://raw.githubusercontent.com/niiyz/JapanCityGeoJson/master/geojson/prefectures.json',
+        'https://raw.githubusercontent.com/dataofjapan/land/master/japan.geojson'
+      ];
+      for (const s of sources) {
+        try {
+          const res = await fetch(s);
+          if (res.ok) {
+            const j = await res.json();
+            return j;
+          }
+        } catch(e) {
+          console.warn('failed', s);
+        }
+      }
+      // フォールバック
+      return {
+        type: 'FeatureCollection',
+        features: prefectures.map(pref => {
+          const points = [];
+          const radius = 0.5;
+          for (let i=0;i<=360;i+=10){
+            const rad = i * Math.PI/180;
+            const lat = pref.lat + radius * Math.sin(rad);
+            const lon = pref.lon + radius * Math.cos(rad);
+            points.push([lon, lat]);
+          }
+          return { type: 'Feature', properties: { name: pref.name }, geometry: { type: 'Polygon', coordinates: [points] } };
+        })
+      };
+    }
+
+    // SVG 描画
+    function renderMap() {
+      if (!japanData) return;
+      loadingMap.style.display = 'none';
+      svg.style('display','block');
+
+      svg.selectAll('*').remove();
+      const width = 850, height = 680;
+      svg.attr('viewBox','0 0 850 680');
+
+      svg.append('rect').attr('width', width).attr('height', height).attr('fill','#e8f4f8');
+
+      const projection = d3.geoMercator().center([137,38]).scale(1400).translate([width/2, height/2]);
+      const path = d3.geoPath().projection(projection);
+      const g = svg.append('g');
+
+      g.selectAll('path')
+        .data(japanData.features)
+        .enter()
+        .append('path')
+        .attr('d', path)
+        .attr('fill', d => {
+          const prefName = d.properties.name || d.properties.nam_ja || d.properties.name_ja;
+          const intensity = prefectureIntensities[prefName];
+          return intensity ? getIntensityColor(intensity.scale) : '#f0f0f0';
+        })
+        .attr('stroke','#333')
+        .attr('stroke-width',0.5)
+        .attr('opacity', d => {
+          const prefName = d.properties.name || d.properties.nam_ja || d.properties.name_ja;
+          const intensity = prefectureIntensities[prefName];
+          return intensity ? 0.9 : 0.5;
+        });
+
+      // 県庁所在地マーカー
+      prefectures.forEach(pref => {
+        const intensity = prefectureIntensities[pref.name];
+        if (!intensity) return;
+        const coords = projection([pref.lon, pref.lat]);
+        g.append('circle').attr('cx', coords[0]).attr('cy', coords[1]).attr('r',8)
+          .attr('fill', getIntensityColor(intensity.scale)).attr('stroke','#fff').attr('stroke-width',1.5);
+        g.append('text').attr('x', coords[0]).attr('y', coords[1]-12).attr('text-anchor','middle')
+          .attr('font-weight','bold').attr('font-size','12px').attr('fill', getIntensityColor(intensity.scale))
+          .text(intensity.scale);
+      });
+
+      // 震源
+      const epicenterCoords = projection([epicenterLon, epicenterLat]);
+      g.append('circle').attr('cx', epicenterCoords[0]).attr('cy', epicenterCoords[1]).attr('r',10)
+        .attr('fill','#ff0000').attr('stroke','#fff').attr('stroke-width',2);
+      g.append('text').attr('x', epicenterCoords[0]).attr('y', epicenterCoords[1]-15).attr('text-anchor','middle')
+        .attr('font-weight','bold').attr('font-size','14px').attr('fill','#ff0000').text('★震源');
+    }
+
+    // 計算：全県の震度（現在時刻シミュレーション秒）
+    function calculateAllPrefectureIntensities(currentTime) {
+      const intensities = {};
+      prefectures.forEach(pref => {
+        const distance = calculateDistance(epicenterLat, epicenterLon, pref.lat, pref.lon);
+        const prefData = estimateAVS30FromLocation(pref.lat, pref.lon);
+        const arrivalTime = calculateSWaveArrivalTime(distance, depth, prefData.avs30);
+        if (currentTime >= arrivalTime) {
+          const hypoDist = calculateHypocentralDistance(distance, depth);
+          const amp = calculateAmplificationFromAVS30(prefData.avs30);
+          const pgv = predictPGV(magnitude, hypoDist, depth);
+          const intensity = pgvToIntensity(pgv, amp);
+          intensities[pref.name] = {
+            value: intensity,
+            scale: getIntensityScale(intensity),
+            arrivalTime,
+            distance,
+            avs30: prefData.avs30
+          };
+        }
+      });
+      return intensities;
+    }
+
+    // シミュレーションループ
+    function startSimulation(){
+      if (isSimulating) return;
+      isSimulating = true;
+      simStartTime = performance.now();
+      startBtn.classList.add('hidden');
+      stopBtn.classList.remove('hidden');
+      animate();
+    }
+
+    function stopSimulation(){
+      isSimulating = false;
+      startBtn.classList.remove('hidden');
+      stopBtn.classList.add('hidden');
+      if (animationId) cancelAnimationFrame(animationId);
+    }
+
+    function resetSimulation(){
+      stopSimulation();
+      prefectureIntensities = {};
+      simTimeEl.textContent = '0.0';
+      reachedCountEl.textContent = '0';
+      reachedListEl.innerHTML = '';
+      renderMap();
+      updatePredictionCard(computePointPrediction());
+    }
+
+    function animate(){
+      animationId = requestAnimationFrame(() => {
+        const elapsed = (performance.now() - simStartTime) / 1000;
+        const speed = parseFloat(simSpeedEl.value) || 1;
+        const simulatedTime = elapsed * speed;
+        simTimeEl.textContent = simulatedTime.toFixed(1);
+
+        prefectureIntensities = calculateAllPrefectureIntensities(simulatedTime);
+        reachedCountEl.textContent = Object.keys(prefectureIntensities).length;
+        // list
+        const entries = Object.entries(prefectureIntensities).sort((a,b)=>a[1].arrivalTime-b[1].arrivalTime);
+        reachedListEl.innerHTML = entries.map(([name,data])=>{
+          const color = getIntensityColor(data.scale);
+          return '<div class="flex justify-between items-center p-2 bg-white rounded text-xs">'+
+            '<span class="font-medium">'+name+'</span>'+
+            '<div class="flex items-center gap-2">'+
+            '<span class="text-gray-600">'+data.arrivalTime.toFixed(1)+'s</span>'+
+            '<span class="text-gray-500">AVS30:'+data.avs30+'</span>'+
+            '<span style="background:'+color+'30;color:'+color+'" class="font-bold px-2 py-1 rounded">震度'+data.scale+'</span>'+
+            '</div></div>';
+        }).join('');
+
+        renderMap();
+
+        if (isSimulating) {
+          // 停止条件：最大到達時間+余裕
+          const maxDistance = Math.max(...prefectures.map(p=>calculateDistance(epicenterLat, epicenterLon, p.lat, p.lon)));
+          const maxTime = calculateSWaveArrivalTime(maxDistance, depth, 450);
+          if (simulatedTime < maxTime + 10) {
+            animate();
+          } else {
+            stopSimulation();
+          }
+        }
+      });
+    }
+
+    // イベント登録（UI => 状態）
+    magnitudeEl.addEventListener('input', e => {
+      magnitude = parseFloat(e.target.value);
+      magLabel.textContent = magnitude.toFixed(1);
+      updatePredictionCard(computePointPrediction());
+    });
+    depthEl.addEventListener('input', e => {
+      depth = parseFloat(e.target.value);
+      depthLabel.textContent = depth;
+      updatePredictionCard(computePointPrediction());
+    });
+    targetLatEl.addEventListener('input', e => {
+      targetLat = parseFloat(e.target.value);
+      if (autoAmplification) recomputeAVS30();
+      updatePredictionCard(computePointPrediction());
+    });
+    targetLonEl.addEventListener('input', e => {
+      targetLon = parseFloat(e.target.value);
+      if (autoAmplification) recomputeAVS30();
+      updatePredictionCard(computePointPrediction());
+    });
+    epicenterLatEl.addEventListener('input', e => {
+      epicenterLat = parseFloat(e.target.value);
+      updatePredictionCard(computePointPrediction());
+    });
+    epicenterLonEl.addEventListener('input', e => {
+      epicenterLon = parseFloat(e.target.value);
+      updatePredictionCard(computePointPrediction());
+    });
+
+    autoSwitch.addEventListener('click', () => {
+      autoAmplification = !autoAmplification;
+      autoSwitch.classList.toggle('on', autoAmplification);
+      if (autoAmplification) recomputeAVS30();
+      else { /* 手動のまま */ }
+      updatePredictionCard(computePointPrediction());
+    });
+
+    startBtn.addEventListener('click', startSimulation);
+    stopBtn.addEventListener('click', stopSimulation);
+    resetBtn.addEventListener('click', resetSimulation);
+
+    function recomputeAVS30(){
+      const data = estimateAVS30FromLocation(targetLat, targetLon);
+      avs30 = data.avs30; geologyType = data.type;
+      amplificationFactor = calculateAmplificationFromAVS30(avs30);
+      geologyEl.textContent = geologyType;
+      avs30El.textContent = avs30;
+      ampEl.textContent = amplificationFactor.toFixed(2);
+    }
+
+    // 初期処理
+    (async function init(){
+      recomputeAVS30();
+      updatePredictionCard(computePointPrediction());
+      // GeoJSON 読み込み
+      try {
+        japanData = await loadJapanGeo();
+      } catch(e) {
+        japanData = null;
+      }
+      renderMap(); // 初回描画
+    })();
+
+    // 最後に予測カード更新
+    updatePredictionCard(computePointPrediction());
+
+  })();
+  </script>
+</body>
+</html>
+`;
+
+async function handleRequest(request) {
+  return new Response(HTML, {
+    headers: { 'content-type': 'text/html; charset=utf-8' }
+  });
+}
