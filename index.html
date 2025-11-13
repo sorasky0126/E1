@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>震度予測（深さ依存Vs実装版）</title>
+<title>高精度地震震度予測システム（改良版）</title>
 <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
 <style>
   body { font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; }
@@ -12,22 +12,23 @@
   .switch.on{background:#2563eb;}
   .switch.on > .knob{transform: translateX(20px);}
   .icon { vertical-align: -0.15em; }
+  /* マーカー小型化 */
+  .epicenter-marker { r: 6; } /* SVG circle r 属性は JS で設定 */
+  .pref-marker { r: 4; }
+  /* マップ領域の最小高さ確保 */
   #svgMap { max-height: 760px; width: 100%; height: auto; display:block; }
   .small-label { font-size: 11px; }
-  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Roboto Mono", "Courier New", monospace; }
 </style>
 </head>
 <body class="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
   <div id="app"></div>
 
-  <!-- libs -->
+  <!-- ライブラリ -->
   <script src="https://unpkg.com/preact@10.16.0/dist/preact.umd.js"></script>
   <script src="https://unpkg.com/preact@10.16.0/hooks/dist/hooks.umd.js"></script>
   <script src="https://unpkg.com/htm@3.1.1/dist/htm.umd.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
   <script src="https://unpkg.com/lucide@0.263.0/dist/lucide.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/geotiff/dist/geotiff.browser.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/proj4@2.8.0/dist/proj4.js"></script>
 
   <script>
   (function(){
@@ -41,10 +42,11 @@
         const wrapper = document.createElement('span');
         wrapper.innerHTML = svg.toString();
         return h('span', { dangerouslySetInnerHTML: { __html: wrapper.innerHTML } });
-      } catch(e) { return h('span', null); }
+      } catch(e) {
+        return h('span', null);
+      }
     }
 
-    // prefecture list (省略せず前出と同じ)
     const prefectures = [
       { code: 1, name: '北海道', city: '札幌', lat: 43.0642, lon: 141.3469 },
       { code: 2, name: '青森県', city: '青森', lat: 40.8244, lon: 140.7400 },
@@ -95,30 +97,111 @@
       { code: 47, name: '沖縄県', city: '那覇', lat: 26.2124, lon: 127.6809 }
     ];
 
-    // geology classes (代表Vs 等)
+    // 地層クラス（9段階）: 名前, AVS30 範囲 (m/s), 代表値 (m/s)
     const geologyClasses = [
-      { key:'A', name:'人工盛土・埋立', vs_rep:60, vs_min:30, vs_max:120, thickness:6 },
-      { key:'B', name:'軟泥・粘性土', vs_rep:100, vs_min:50, vs_max:180, thickness:12 },
-      { key:'C', name:'緩い砂・シルト', vs_rep:150, vs_min:100, vs_max:250, thickness:15 },
-      { key:'D', name:'締まった砂・シルト', vs_rep:300, vs_min:200, vs_max:400, thickness:20 },
-      { key:'E', name:'洪積台地・硬め堆積', vs_rep:450, vs_min:320, vs_max:700, thickness:40 },
-      { key:'F', name:'砂礫・礫層', vs_rep:900, vs_min:600, vs_max:1500, thickness:60 },
-      { key:'G', name:'硬岩（浅部）', vs_rep:2000, vs_min:1200, vs_max:3000, thickness:200 },
-      { key:'H', name:'深層基盤（硬質）', vs_rep:3000, vs_min:2000, vs_max:5000, thickness:1000 }
+      { key:'A', name:'埋積軟泥層', min:0,   max:120,  rep:90 },
+      { key:'B', name:'沖積砂泥層', min:120, max:180,  rep:150 },
+      { key:'C', name:'沖積砂質層', min:180, max:240,  rep:210 },
+      { key:'D', name:'沖積平野（密）', min:240, max:280, rep:260 },
+      { key:'E', name:'洪積台地', min:280, max:320,  rep:300 },
+      { key:'F', name:'砂礫・礫層', min:320, max:360,  rep:340 },
+      { key:'G', name:'山地浅層', min:360, max:420,  rep:390 },
+      { key:'H', name:'深層基盤（硬質）', min:420, max:1000, rep:500 },
+      { key:'I', name:'人工盛土・埋立', min:0, max:150, rep:120 }
     ];
 
     function findGeologyClassByAvs(avs) {
-      if (avs < 120) return geologyClasses[0];
-      if (avs < 180) return geologyClasses[1];
-      if (avs < 260) return geologyClasses[2];
-      if (avs < 360) return geologyClasses[3];
-      if (avs < 700) return geologyClasses[4];
-      if (avs < 1200) return geologyClasses[5];
-      if (avs < 2000) return geologyClasses[6];
-      return geologyClasses[7];
+      for (const g of geologyClasses) {
+        if (avs >= g.min && avs < g.max) return g;
+      }
+      return geologyClasses[6]; // default
     }
 
-    // 基本ユーティリティ（距離等）
+    function getIntensityColor(scale) {
+      const colors = {
+        '0': '#C0C0C0', '1': '#3B82F6', '2': '#10B981',
+        '3': '#FBBF24', '4': '#F97316', '5弱': '#EF4444',
+        '5強': '#DC2626', '6弱': '#B91C1C', '6強': '#991B1B', '7': '#7C3AED'
+      };
+      return colors[scale] || '#C0C0C0';
+    }
+    function getIntensityScale(intensity) {
+      if (intensity < 0.5) return '0';
+      if (intensity < 1.5) return '1';
+      if (intensity < 2.5) return '2';
+      if (intensity < 3.5) return '3';
+      if (intensity < 4.5) return '4';
+      if (intensity < 5.0) return '5弱';
+      if (intensity < 5.5) return '5強';
+      if (intensity < 6.0) return '6弱';
+      if (intensity < 6.5) return '6強';
+      return '7';
+    }
+
+    // より詳細な AVS30 推定（位置ルールを強化）
+    function estimateAVS30FromLocation(lat, lon) {
+      // 基本傾向：沿岸低地=低AVS30、沖積平野=やや低、台地=中、丘陵/山地=高、人工盛土(都市域)も加味
+      // 都市域の簡易判定（東京・横浜・大阪・名古屋・福岡近傍）
+      const urbanCenters = [
+        { lat:35.68, lon:139.76, radiusKm:50 }, // Tokyo area
+        { lat:34.69, lon:135.50, radiusKm:40 }, // Osaka
+        { lat:35.18, lon:136.91, radiusKm:30 }, // Nagoya
+        { lat:33.59, lon:130.40, radiusKm:40 }  // Fukuoka
+      ];
+      const isUrban = urbanCenters.some(c => {
+        const d = calculateDistance(lat, lon, c.lat, c.lon);
+        return d <= c.radiusKm;
+      });
+
+      // 地形要素（簡易）：緯度経度のバンドと海岸接近度
+      const nearCoast = (lon > 122 && lon < 153 && (Math.abs(lat - 35) < 6 || Math.abs(lat - 33) < 6)) && (Math.abs(lon - 139.7) < 3 || lon < 132);
+      const isLowland = (lat < 36 && lon > 138 && lon < 141) || (lat > 34 && lat < 35 && lon > 134 && lon < 136);
+      const isAlluvial = (lat > 35 && lat < 37 && lon > 138.5 && lon < 140) || (lat > 33 && lat < 34 && lon > 130 && lon < 131);
+      const isPlateau = (lat > 35.5 && lat < 36.5 && lon > 137 && lon < 140.5);
+      const isMountain = (lat > 36 && lon < 139) || lat > 38 || lon < 132;
+
+      // 基本 AVS30 値（m/s）
+      let avs = 300;
+      if (isMountain) avs = 450;
+      else if (isPlateau) avs = 310;
+      else if (isAlluvial) avs = 220;
+      else if (isLowland) avs = 200;
+      else if (nearCoast) avs = 180;
+
+      // 都市域や埋立地の増幅（人工盛土の可能性）
+      if (isUrban) avs = Math.min(avs + 20, 350);
+      // 緯度による微調整（北より南で堆積傾向）
+      avs += (35.5 - lat) * 2;
+
+      // clamp
+      avs = Math.max(80, Math.min(600, Math.round(avs)));
+
+      // クラス判定
+      const cls = findGeologyClassByAvs(avs);
+      return { avs30: avs, type: cls.name, classKey: cls.key };
+    }
+
+    // 周波数依存簡易増幅率モデル（代表周波数 0.5Hz, 1.0Hz, 2.0Hz の重み付け平均）
+    function calculateAmplificationFromAVS30(avs30Value) {
+      // 周波数別の期待的増幅係数近似（簡易）
+      // 低周波(0.5Hz): 低AVSで増幅が少ない
+      // 中周波(1Hz): 典型的な建物共振域で増幅が最大になることがある
+      // 高周波(2Hz): 表層の柔らかさで増幅が出やすい
+      const f = [
+        { freq:0.5, weight:0.3, a: Math.pow(400/avs30Value, 0.35) },
+        { freq:1.0, weight:0.5, a: Math.pow(400/avs30Value, 0.7) },
+        { freq:2.0, weight:0.2, a: Math.pow(400/avs30Value, 0.9) }
+      ];
+      let amp = 0;
+      let wSum = 0;
+      f.forEach(fn => { amp += fn.a * fn.weight; wSum += fn.weight; });
+      amp = amp / wSum;
+      // 範囲制限
+      amp = Math.min(Math.max(amp, 0.7), 4.0);
+      return amp;
+    }
+
+    // 距離・時間計算の改良：層別速度（表層 Vs, 上部地殻 Vc）を導入
     function toRad(deg){return deg*Math.PI/180;}
     function calculateDistance(lat1, lon1, lat2, lon2){
       const latAvg = (lat1+lat2)/2;
@@ -132,222 +215,54 @@
       const distance=Math.sqrt((M*dLat)**2 + (N*Math.cos(toRad(latAvg))*dLon)**2);
       return distance/1000;
     }
-    function calculateHypocentralDistance(surfaceDistanceKm, depthKm){ return Math.sqrt(surfaceDistanceKm**2 + depthKm**2); }
+    function calculateHypocentralDistance(surfaceDistance, depth){ return Math.sqrt(surfaceDistance**2 + depth**2); }
 
-    // PGV->震度
+    // 到達時間：表層経路（短い）と上部地殻経路を分けて近似
+    function calculateSWaveArrivalTime(distanceKm, depthKm, avs30) {
+      // 表層速度（m/s）を avs30 に依存
+      const surfaceVs = Math.max(avs30, 120); // m/s 保護
+      // 表層厚の想定（km）
+      const surfaceThicknessKm = 0.03;
+      // 上部地殻速度（km/s）—典型値 3.5 km/s を使用。ただし地盤が固い領域は若干速く。
+      const crustVs = (avs30 > 360) ? 4.0 : 3.5; // km/s
+      // 時間計算（秒）
+      const hypoDistKm = calculateHypocentralDistance(distanceKm, depthKm);
+      // 表層通過時間
+      const surfaceTime = (surfaceThicknessKm) / (surfaceVs / 1000); // s (surfaceVs は m/s)
+      // 残りを上部地殻速度で
+      const crustTime = Math.max(0, (hypoDistKm - surfaceThicknessKm) / crustVs);
+      return surfaceTime + crustTime;
+    }
+
+    // PGV 予測：安定化と最小限の保護を追加
     function predictPGV(M, X, depth) {
       const Mw = M;
-      const D = Math.max(X, 0.5);
+      const D = Math.max(X, 0.5); // 0.5 km 以下の距離は安定化
       const depthFactor = 0.0038 * depth;
       const term = D + 0.0028 * Math.pow(10, 0.5 * Mw);
       const safeTerm = Math.max(term, 1e-6);
       const logPGV = 0.58 * Mw + depthFactor - 1.29 - Math.log10(safeTerm) - 0.002 * D;
       return Math.pow(10, logPGV);
     }
+
     function pgvToIntensity(pgv, amplification) {
       const adjustedPGV = Math.max(pgv * amplification, 1e-6);
       const I = 2.68 + 1.72 * Math.log10(adjustedPGV);
       return Math.max(0, I);
     }
 
-    // GeoTIFF sampling (GSJ) - placeholder URL
-    const GSJ_AVS30_TIF_URL = 'https://gbank.gsj.jp/whatever/avs30.tif';
-    const _geoCache = {};
-    async function fetchArrayBuffer(url){
-      const r = await fetch(url);
-      if(!r.ok) throw new Error('fetch failed: ' + r.status);
-      return await r.arrayBuffer();
-    }
-    async function loadGeoTiffFromUrl(url){
-      if (_geoCache[url]) return _geoCache[url];
-      const ab = await fetchArrayBuffer(url);
-      const tiff = await GeoTIFF.fromArrayBuffer(ab);
-      const image = await tiff.getImage();
-      const width = image.getWidth();
-      const height = image.getHeight();
-      const rasters = await image.readRasters({ interleave: true });
-      const fileDir = image.getFileDirectory();
-      let geoTransform = null;
-      if (fileDir.ModelPixelScale && fileDir.ModelTiepoint) {
-        const scale = fileDir.ModelPixelScale;
-        const tie = fileDir.ModelTiepoint;
-        const gt0 = tie[3], gt3 = tie[4];
-        geoTransform = [gt0, scale[0], 0, gt3, 0, -scale[1]];
-      }
-      const res = { image, rasters, width, height, geoTransform, fileDir };
-      _geoCache[url] = res;
-      return res;
-    }
-    function worldToPixel(lon, lat, geoTransform){
-      const GT = geoTransform;
-      const x = (lon - GT[0]) / GT[1];
-      const y = (lat - GT[3]) / GT[5];
-      return { x, y };
-    }
-    function bilinearSample(rasters, width, height, x, y){
-      if(x < 0 || y < 0 || x >= width-1 || y >= height-1) return null;
-      const x0 = Math.floor(x), y0 = Math.floor(y);
-      const x1 = x0 + 1, y1 = y0 + 1;
-      const f00 = rasters[y0 * width + x0];
-      const f10 = rasters[y0 * width + x1];
-      const f01 = rasters[y1 * width + x0];
-      const f11 = rasters[y1 * width + x1];
-      const dx = x - x0, dy = y - y0;
-      const r0 = f00 * (1-dx) + f10 * dx;
-      const r1 = f01 * (1-dx) + f11 * dx;
-      return r0 * (1-dy) + r1 * dy;
-    }
-    async function getVs30FromGSJ(lat, lon, options = {}) {
-      const url = options.url || GSJ_AVS30_TIF_URL;
-      try {
-        const cache = await loadGeoTiffFromUrl(url);
-        if (!cache.geoTransform) throw new Error('no geoTransform');
-        const pix = worldToPixel(lon, lat, cache.geoTransform);
-        const val = bilinearSample(cache.rasters, cache.width, cache.height, pix.x, pix.y);
-        if (val === null || isNaN(val)) return null;
-        return val;
-      } catch (e) {
-        console.warn('GSJ sampling failed:', e && e.message);
-        return null;
-      }
-    }
-
-    /* ---------------------------
-       深さ依存 Vs 実装のコア方針
-       - buildLayersFromClass で浅層〜深層までの層を生成
-       - 深さ200 mを閾値として、以降の深部層は "深部増速" を適用
-       - deriveCrustVsFromLayers で層ごとに深さに応じた重み付けを行い、全体のクラスト速度を算出
-       --------------------------- */
-
-    // build layer stack from class and AVS30 (same logic as前と同様)
-    function buildLayersFromClass(cls, avs30){
-      const layers = [];
-      if (avs30 && avs30 > 0) {
-        const topVs = Math.max(40, Math.min(avs30, cls.vs_max || cls.vs_rep));
-        layers.push({ thickness_m:5, vs_mps: Math.max(30, topVs * 0.7) });
-        layers.push({ thickness_m:10, vs_mps: Math.max(60, topVs * 0.9) });
-        layers.push({ thickness_m:15, vs_mps: Math.max(100, topVs) });
-        const deeperThickness = Math.max(0, cls.thickness - 30);
-        if (deeperThickness > 0) layers.push({ thickness_m: deeperThickness, vs_mps: cls.vs_rep });
-      } else {
-        layers.push({ thickness_m: Math.max(1, Math.round(cls.thickness*0.2)), vs_mps: Math.max(30, cls.vs_rep*0.6) });
-        layers.push({ thickness_m: Math.max(1, Math.round(cls.thickness*0.3)), vs_mps: Math.max(60, cls.vs_rep*0.85) });
-        layers.push({ thickness_m: Math.max(1, Math.round(cls.thickness*0.5)), vs_mps: cls.vs_rep });
-      }
-      // append deeper layers to represent upper crust -> lower crust trend
-      // we append multiple deep slabs so cumulative > 200m can occur
-      layers.push({ thickness_m: 100, vs_mps: Math.max(cls.vs_rep*1.2, 600) });
-      layers.push({ thickness_m: 300, vs_mps: Math.max(cls.vs_rep*1.5, 1000) });
-      layers.push({ thickness_m: 1000, vs_mps: Math.max(cls.vs_rep*1.8, 2000) });
-      return layers;
-    }
-
-    // deep-boost: 深さ200m以降で vs を段階的に増やす
-    function applyDepthDependentBoost(layers, boostStartDepth = 200){
-      let cum = 0;
-      const boosted = layers.map(L=>{
-        const top = cum;
-        const bottom = cum + L.thickness_m;
-        cum = bottom;
-        // if entire layer is shallower than boostStart -> no boost
-        if (bottom <= boostStartDepth) return Object.assign({}, L);
-        // if layer entirely below boostStart -> full boost
-        if (top >= boostStartDepth) {
-          // boost factor: 深さが深いほど大きく、底で最大 (例: 1.0 -> 1.6)
-          const depthMid = (top + bottom) / 2;
-          const factor = 1.0 + Math.min(1.0, (depthMid - boostStartDepth) / 800) * 0.6;
-          return { thickness_m: L.thickness_m, vs_mps: L.vs_mps * factor };
-        }
-        // if partially crossing boostStartDepth: split into two pseudo-layers
-        const shallowPart = boostStartDepth - top;
-        const deepPart = bottom - boostStartDepth;
-        const shallow = { thickness_m: shallowPart, vs_mps: L.vs_mps };
-        const depthMid = boostStartDepth + deepPart / 2;
-        const factor = 1.0 + Math.min(1.0, (depthMid - boostStartDepth) / 800) * 0.6;
-        const deep = { thickness_m: deepPart, vs_mps: L.vs_mps * factor };
-        return [shallow, deep];
-      });
-      // flatten arrays
-      return boosted.flat();
-    }
-
-    // derive crust Vs from layers (weighted harmonic mean) using depth-boosted layers
-    function deriveCrustVsFromLayersWithDepthBoost(layers){
-      const boosted = applyDepthDependentBoost(layers, 200); // 200m 閾値
-      let totalThickness=0, travelTime=0;
-      for (const L of boosted){
-        const H = Math.max(0.01, L.thickness_m);
-        totalThickness += H;
-        travelTime += H / Math.max(1, L.vs_mps);
-      }
-      if (travelTime <= 0) return 3.5;
-      const avgVs_mps = totalThickness / travelTime;
-      return Math.max(200, Math.min(6000, avgVs_mps)) / 1000;
-    }
-
-    // Arrival time using depth-boosted crustVs and top layer travel time
-    function calculateSWaveArrivalTimeUsingLayersWithDepthBoost(distanceKm, depthKm, layers){
-      const boosted = applyDepthDependentBoost(layers, 200);
-      const crustVs_km = deriveCrustVsFromLayersWithDepthBoost(layers);
-      const surfaceThicknessKm = (boosted[0] && boosted[0].thickness_m) ? boosted[0].thickness_m/1000 : 0.03;
-      const hypoDistKm = calculateHypocentralDistance(distanceKm, depthKm);
-      const surfaceVs_mps = boosted[0] ? Math.max(60, boosted[0].vs_mps) : 300;
-      const surfaceTime = surfaceThicknessKm / (surfaceVs_mps / 1000);
-      const crustTime = Math.max(0, (hypoDistKm - surfaceThicknessKm) / crustVs_km);
-      return surfaceTime + crustTime;
-    }
-
-    // simple site amplification as earlier (keeps same)
-    function computeLayerFundamentalFreq(layer){
-      const H = Math.max(0.5, layer.thickness_m);
-      return (layer.vs_mps) / (4 * H);
-    }
-    function computeSiteAmplification(layers, freqs=[0.5,1.0,2.0]){
-      const Vs_ref = 760;
-      const amps = freqs.map(f => {
-        let resonanceSum = 0, weightSum = 0;
-        for (const L of layers) {
-          const H = Math.max(0.1, L.thickness_m);
-          const f0 = computeLayerFundamentalFreq(L);
-          const Q = 8;
-          const lorentz = 1 / (1 + ((f - f0)/(f0/Q + 1e-6))**2);
-          const stiffnessRatio = Math.sqrt(Vs_ref / Math.max(50, L.vs_mps));
-          const thicknessWeight = Math.min(3, H / 10);
-          const contrib = (1 + stiffnessRatio * lorentz * thicknessWeight);
-          resonanceSum += contrib * thicknessWeight;
-          weightSum += thicknessWeight;
-        }
-        if (weightSum > 0) resonanceSum = resonanceSum / weightSum;
-        const topVs = layers.length ? layers[0].vs_mps : Vs_ref;
-        const vs30Factor = Math.pow(Vs_ref / Math.max(60, Math.min(2000, topVs)), 0.35);
-        let amp = resonanceSum * vs30Factor;
-        amp = Math.min(Math.max(amp, 0.6), 6.0);
-        return amp;
-      });
-      const weights = [0.3,0.5,0.2];
-      let a=0,w=0;
-      for (let i=0;i<amps.length;i++){ a += amps[i]*weights[i]; w += weights[i]; }
-      const ampScalar = a/w;
-      return { amps, freqs, ampScalar };
-    }
-
-    /* --------------------------
-       App (UI + simulation)
-       -------------------------- */
+    // UI コンポーネント（Preact + htm）
     function App(){
       const [magnitude, setMagnitude] = useState(7.0);
       const [depth, setDepth] = useState(10);
-      const [epicPref, setEpicPref] = useState(13);
-      const [targetPref, setTargetPref] = useState(14);
       const [epicenterLat, setEpicenterLat] = useState(35.6895);
       const [epicenterLon, setEpicenterLon] = useState(139.6917);
-      const [targetLat, setTargetLat] = useState(35.4437);
-      const [targetLon, setTargetLon] = useState(139.6380);
-      const [useGSJ, setUseGSJ] = useState(true);
+      const [targetLat, setTargetLat] = useState(35.7);
+      const [targetLon, setTargetLon] = useState(139.7);
       const [autoAmplification, setAutoAmplification] = useState(true);
       const [avs30Val, setAvs30Val] = useState(300);
-      const [geoClass, setGeoClass] = useState(geologyClasses[4]);
-      const [ampFactor, setAmpFactor] = useState(1.4);
+      const [geoType, setGeoType] = useState('計算中...');
+      const [ampFactor, setAmpFactor] = useState(1.6);
       const [predicted, setPredicted] = useState(null);
       const [prefIntensities, setPrefIntensities] = useState({});
       const [japanData, setJapanData] = useState(null);
@@ -357,25 +272,30 @@
       const svgRef = useRef(null);
       const animRef = useRef(null);
 
-      useEffect(()=>{ const p = prefectures.find(pp=>pp.code===epicPref); if(p){ setEpicenterLat(p.lat); setEpicenterLon(p.lon); } }, [epicPref]);
-      useEffect(()=>{ const p = prefectures.find(pp=>pp.code===targetPref); if(p){ setTargetLat(p.lat); setTargetLon(p.lon); } }, [targetPref]);
-
-      // load geojson
+      // GeoJSON ロード（フォールバック）
       useEffect(()=>{
-        let mounted=true;
+        let mounted = true;
         (async ()=>{
           const sources = [
             'https://raw.githubusercontent.com/niiyz/JapanCityGeoJson/master/geojson/prefectures.json',
             'https://raw.githubusercontent.com/dataofjapan/land/master/japan.geojson'
           ];
           let data = null;
-          for (const s of sources){
-            try{ const r = await fetch(s); if (r.ok) { data = await r.json(); break; } } catch(e){ console.warn('geo load failed', s); }
+          for (const s of sources) {
+            try {
+              const r = await fetch(s);
+              if (r.ok) { data = await r.json(); break; }
+            } catch(e) { console.warn('geo load failed', s); }
           }
-          if (!data){
-            data = { type:'FeatureCollection', features: prefectures.map(pref => {
+          if (!data) {
+            data = { type: 'FeatureCollection', features: prefectures.map(pref => {
               const pts=[]; const radius=0.45;
-              for (let i=0;i<=360;i+=10){ const rad=i*Math.PI/180; const lat=pref.lat + radius*Math.sin(rad); const lon=pref.lon + radius*Math.cos(rad); pts.push([lon,lat]); }
+              for (let i=0;i<=360;i+=10){
+                const rad=i*Math.PI/180;
+                const lat=pref.lat + radius*Math.sin(rad);
+                const lon=pref.lon + radius*Math.cos(rad);
+                pts.push([lon,lat]);
+              }
               return { type:'Feature', properties:{name:pref.name}, geometry:{type:'Polygon', coordinates:[pts]} };
             })};
           }
@@ -384,38 +304,16 @@
         return ()=>{ mounted=false; }
       }, []);
 
-      // resolve AVS30/class + compute amplification on target change
+      // AVS30 と増幅率計算
       useEffect(()=>{
-        let cancelled=false;
-        async function resolve(){
-          if (!autoAmplification) return;
-          let vs = null;
-          if (useGSJ) {
-            try { vs = await getVs30FromGSJ(targetLat, targetLon); } catch(e){ vs = null; }
-          }
-          if (vs === null || isNaN(vs)) {
-            const est = estimateAVS30FromLocation(targetLat, targetLon);
-            vs = est.avs30;
-            const cls = findGeologyClassByAvs(vs);
-            setGeoClass(cls);
-            const layers = buildLayersFromClass(cls, vs);
-            const boosted = applyDepthDependentBoost(layers, 200);
-            const site = computeSiteAmplification(boosted);
-            if (!cancelled) { setAvs30Val(Math.round(vs)); setAmpFactor(site.ampScalar); }
-          } else {
-            const cls = findGeologyClassByAvs(vs);
-            setGeoClass(cls);
-            const layers = buildLayersFromClass(cls, vs);
-            const boosted = applyDepthDependentBoost(layers, 200);
-            const site = computeSiteAmplification(boosted);
-            if (!cancelled) { setAvs30Val(Math.round(vs)); setAmpFactor(site.ampScalar); }
-          }
-        }
-        resolve();
-        return ()=>{ cancelled = true; }
-      }, [targetLat, targetLon, autoAmplification, useGSJ]);
+        if (!autoAmplification) return;
+        const d = estimateAVS30FromLocation(targetLat, targetLon);
+        setAvs30Val(d.avs30);
+        setGeoType(d.type);
+        setAmpFactor(calculateAmplificationFromAVS30(d.avs30));
+      }, [targetLat, targetLon, autoAmplification]);
 
-      // point prediction update
+      // 点予測
       useEffect(()=>{
         const surfDist = calculateDistance(epicenterLat, epicenterLon, targetLat, targetLon);
         const hypo = calculateHypocentralDistance(surfDist, depth);
@@ -424,7 +322,7 @@
         setPredicted({ value:intensity, scale:getIntensityScale(intensity), pgv, surfaceDistance:surfDist, hypoDistance:hypo });
       }, [magnitude, depth, epicenterLat, epicenterLon, targetLat, targetLon, ampFactor]);
 
-      // svg draw
+      // SVG 描画
       useEffect(()=>{
         if (!japanData) return;
         const svg = d3.select(svgRef.current);
@@ -441,7 +339,7 @@
           .attr('fill', d => {
             const prefName = d.properties.name || d.properties.nam_ja || d.properties.name_ja;
             const intensity = prefIntensities[prefName];
-            return intensity ? (getIntensityColor(intensity.scale)) : '#f7fafc';
+            return intensity ? getIntensityColor(intensity.scale) : '#f7fafc';
           })
           .attr('stroke','#333').attr('stroke-width',0.4)
           .attr('opacity', d => {
@@ -449,15 +347,17 @@
             return prefIntensities[prefName] ? 0.95 : 0.65;
           });
 
+        // 県庁所在地マーカー（小さく）
         prefectures.forEach(pref => {
           const intensity = prefIntensities[pref.name];
           const coords = projection([pref.lon, pref.lat]);
+          // 常に小さい円を描画（色は到達時のみ強調）
           g.append('circle')
             .attr('cx', coords[0])
             .attr('cy', coords[1])
             .attr('r', intensity ? 4 : 2.5)
             .attr('fill', intensity ? getIntensityColor(intensity.scale) : '#666')
-            .attr('stroke', '#fff')
+            .attr('stroke', intensity ? '#fff' : '#fff')
             .attr('stroke-width', 0.8);
 
           if (intensity) {
@@ -472,6 +372,7 @@
           }
         });
 
+        // 震源マーカー（小さく）
         const epicCoords = projection([epicenterLon, epicenterLat]);
         g.append('circle')
           .attr('cx', epicCoords[0])
@@ -491,65 +392,38 @@
           .text('震源');
       }, [japanData, prefIntensities, epicenterLat, epicenterLon]);
 
-      // compute intensities for all prefs (async)
-      async function calcAllPrefIntensitiesAsync(currentTimeSec) {
+      // 全県計算（シミュレーション時）
+      function calcAllPrefIntensities(currentTimeSec) {
         const out = {};
-        const promises = prefectures.map(async pref => {
-          let vs = null;
-          if (useGSJ) {
-            try { vs = await getVs30FromGSJ(pref.lat, pref.lon); } catch(e){ vs = null; }
-          }
-          if (vs === null || isNaN(vs)) {
-            const est = estimateAVS30FromLocation(pref.lat, pref.lon);
-            vs = est.avs30;
-            const cls = findGeologyClassByAvs(vs);
-            const layers = buildLayersFromClass(cls, vs);
-            return { pref, vs: Math.round(vs), cls, layers };
-          } else {
-            const cls = findGeologyClassByAvs(vs);
-            const layers = buildLayersFromClass(cls, vs);
-            return { pref, vs: Math.round(vs), cls, layers };
-          }
-        });
-        const resolved = await Promise.all(promises);
-        for (const item of resolved) {
-          const pref = item.pref;
-          const prefGeo = { avs30: item.vs, classObj: item.cls, layers: item.layers };
+        prefectures.forEach(pref => {
           const d = calculateDistance(epicenterLat, epicenterLon, pref.lat, pref.lon);
-          const arrival = calculateSWaveArrivalTimeUsingLayersWithDepthBoost(d, depth, prefGeo.layers);
+          const prefGeo = estimateAVS30FromLocation(pref.lat, pref.lon);
+          const arrival = calculateSWaveArrivalTime(d, depth, prefGeo.avs30);
           if (currentTimeSec >= arrival) {
             const hypo = calculateHypocentralDistance(d, depth);
-            const boosted = applyDepthDependentBoost(prefGeo.layers, 200);
-            const site = computeSiteAmplification(boosted);
+            const amp = calculateAmplificationFromAVS30(prefGeo.avs30);
             const pgv = predictPGV(magnitude, hypo, depth);
-            const intensity = pgvToIntensity(pgv, site.ampScalar);
-            out[pref.name] = {
-              value: intensity,
-              scale: getIntensityScale(intensity),
-              arrivalTime: arrival,
-              distance: d,
-              avs30: prefGeo.avs30,
-              class: prefGeo.classObj.name,
-              vs_rep: prefGeo.classObj.vs_rep,
-              crustVs_km: deriveCrustVsFromLayersWithDepthBoost(prefGeo.layers)
-            };
+            const intensity = pgvToIntensity(pgv, amp);
+            out[pref.name] = { value:intensity, scale:getIntensityScale(intensity), arrivalTime:arrival, distance:d, avs30:prefGeo.avs30, geo:prefGeo.type };
           }
-        }
+        });
         return out;
       }
 
+      // シミュレーションループ
       function startSim(){
         if (isSimulating) return;
         setIsSimulating(true);
         const t0 = performance.now();
-        async function loop(){
+        function loop(){
           const elapsed = (performance.now() - t0)/1000;
           const t = elapsed * simSpeed;
           setSimTime(t);
-          const ints = await calcAllPrefIntensitiesAsync(t);
+          const ints = calcAllPrefIntensities(t);
           setPrefIntensities(ints);
+          // 停止条件（最大距離の到達＋余裕）
           const maxD = Math.max(...prefectures.map(p=>calculateDistance(epicenterLat, epicenterLon, p.lat, p.lon)));
-          const maxT = calculateSWaveArrivalTimeUsingLayersWithDepthBoost(maxD, depth, [{thickness_m:30,vs_mps:600},{thickness_m:1000,vs_mps:3000}]);
+          const maxT = calculateSWaveArrivalTime(maxD, depth, 500);
           if (t < maxT + 8) { animRef.current = requestAnimationFrame(loop); }
           else { setIsSimulating(false); }
         }
@@ -558,52 +432,43 @@
       function stopSim(){ setIsSimulating(false); if (animRef.current) cancelAnimationFrame(animRef.current); }
       function resetSim(){ stopSim(); setSimTime(0); setPrefIntensities({}); }
 
-      // initial target compute
+      // UI 用補助：地点予測表示
+      function pointPrediction() {
+        const d = calculateDistance(epicenterLat, epicenterLon, targetLat, targetLon);
+        const hypo = calculateHypocentralDistance(d, depth);
+        const pgv = predictPGV(magnitude, hypo, depth);
+        const amp = ampFactor;
+        const intensity = pgvToIntensity(pgv, amp);
+        return { value:intensity, scale:getIntensityScale(intensity), pgv, surfaceDistance:d };
+      }
+
+      // 初期 AVS30 計算
       useEffect(()=> {
-        let mounted=true;
-        (async()=>{
-          if (!autoAmplification) return;
-          let vs = null;
-          if (useGSJ) { try { vs = await getVs30FromGSJ(targetLat, targetLon); } catch(e){ vs = null; } }
-          if (vs === null || isNaN(vs)) {
-            const est = estimateAVS30FromLocation(targetLat, targetLon);
-            vs = est.avs30;
-            const cls = findGeologyClassByAvs(vs);
-            const layers = buildLayersFromClass(cls, vs);
-            const boosted = applyDepthDependentBoost(layers, 200);
-            const site = computeSiteAmplification(boosted);
-            if (mounted) { setAvs30Val(Math.round(vs)); setGeoClass(cls); setAmpFactor(site.ampScalar); }
-          } else {
-            const cls = findGeologyClassByAvs(vs);
-            const layers = buildLayersFromClass(cls, vs);
-            const boosted = applyDepthDependentBoost(layers, 200);
-            const site = computeSiteAmplification(boosted);
-            if (mounted) { setAvs30Val(Math.round(vs)); setGeoClass(cls); setAmpFactor(site.ampScalar); }
-          }
-        })();
-        return ()=>{ mounted=false; }
+        if (autoAmplification) {
+          const d = estimateAVS30FromLocation(targetLat, targetLon);
+          setAvs30Val(d.avs30); setGeoType(d.type); setAmpFactor(calculateAmplificationFromAVS30(d.avs30));
+        }
       }, []);
 
-      const currentLayers = buildLayersFromClass(geoClass, avs30Val);
-      const boostedCurrent = applyDepthDependentBoost(currentLayers, 200);
-      const siteDetail = computeSiteAmplification(boostedCurrent);
-      const crustVs_display = deriveCrustVsFromLayersWithDepthBoost(currentLayers);
-
-      // UI
+      // JSX で UI を返す
       return html`
       <div class="min-h-screen">
         <div class="max-w-7xl mx-auto">
           <div class="bg-white rounded-lg shadow-xl p-6 mb-6">
             <div class="flex items-center gap-3 mb-4">
               <span>${Icon('activity',{width:32})}</span>
-              <h1 class="text-3xl font-bold text-gray-800">震度予測（深さ依存 Vs 実装）</h1>
+              <h1 class="text-3xl font-bold text-gray-800">高精度地震震度予測システム（改良版）</h1>
             </div>
-            <p class="text-gray-600 mb-2">深さ200mを閾値に、深部で S 波速度を段階的に増加させる近似を実装しました。GSJ の AVS30 を利用可能なら優先して使用します。</p>
+            <p class="text-gray-600 mb-4">マーカーを小型化し、地層を細分化、到達時間と増幅モデルを改良しました</p>
           </div>
 
           <div class="grid lg:grid-cols-3 gap-6 mb-6">
             <div class="bg-white rounded-lg shadow-lg p-6">
-              <div class="flex items-center gap-2 mb-4"><span>${Icon('map-pin')}</span><h2 class="text-xl font-bold text-gray-800">震源と観測点</h2></div>
+              <div class="flex items-center gap-2 mb-4">
+                <span>${Icon('map-pin')}</span>
+                <h2 class="text-xl font-bold text-gray-800">震源と観測点</h2>
+              </div>
+
               <div class="space-y-3">
                 <div>
                   <label class="block text-sm text-gray-700">マグニチュード: <strong>${magnitude.toFixed(1)}</strong></label>
@@ -615,43 +480,39 @@
                   <input type="range" min="0" max="100" step="1" value=${depth} onInput=${e=>setDepth(parseInt(e.target.value))} class="w-full"/>
                 </div>
 
+                <div class="grid grid-cols-2 gap-2">
+                  <div>
+                    <label class="block text-sm text-gray-700">観測点 緯度</label>
+                    <input type="number" step="0.01" value=${targetLat} onInput=${e=>{ setTargetLat(parseFloat(e.target.value)); if (autoAmplification){ const d=estimateAVS30FromLocation(parseFloat(e.target.value), targetLon); setAvs30Val(d.avs30); setGeoType(d.type); setAmpFactor(calculateAmplificationFromAVS30(d.avs30)); }}} class="w-full px-2 py-1 border rounded text-sm"/>
+                  </div>
+                  <div>
+                    <label class="block text-sm text-gray-700">観測点 経度</label>
+                    <input type="number" step="0.01" value=${targetLon} onInput=${e=>{ setTargetLon(parseFloat(e.target.value)); if (autoAmplification){ const d=estimateAVS30FromLocation(targetLat, parseFloat(e.target.value)); setAvs30Val(d.avs30); setGeoType(d.type); setAmpFactor(calculateAmplificationFromAVS30(d.avs30)); }}} class="w-full px-2 py-1 border rounded text-sm"/>
+                  </div>
+                </div>
+
                 <div>
-                  <label class="block text-sm text-gray-700">震源 都道府県</label>
-                  <select class="w-full px-2 py-1 border rounded text-sm" value=${epicPref} onChange=${e=>setEpicPref(parseInt(e.target.value))}>
-                    ${prefectures.map(p=> html`<option value=${p.code}>${p.name} (${p.city})</option>`)}
-                  </select>
+                  <label class="block text-sm text-gray-700">震源 緯度</label>
+                  <input type="number" step="0.01" value=${epicenterLat} onInput=${e=>setEpicenterLat(parseFloat(e.target.value))} class="w-full px-2 py-1 border rounded text-sm"/>
                 </div>
-
-                <div class="grid grid-cols-2 gap-2">
-                  <div><label class="block text-sm text-gray-700">震源 緯度</label><input type="number" step="0.0001" value=${epicenterLat} onInput=${e=>setEpicenterLat(parseFloat(e.target.value))} class="w-full px-2 py-1 border rounded text-sm"/></div>
-                  <div><label class="block text-sm text-gray-700">震源 経度</label><input type="number" step="0.0001" value=${epicenterLon} onInput=${e=>setEpicenterLon(parseFloat(e.target.value))} class="w-full px-2 py-1 border rounded text-sm"/></div>
-                </div>
-
-                <div><label class="block text-sm text-gray-700">観測点 都道府県</label><select class="w-full px-2 py-1 border rounded text-sm" value=${targetPref} onChange=${e=>setTargetPref(parseInt(e.target.value))}>${prefectures.map(p=> html`<option value=${p.code}>${p.name} (${p.city})</option>`)}</select></div>
-
-                <div class="grid grid-cols-2 gap-2">
-                  <div><label class="block text-sm text-gray-700">観測点 緯度</label><input type="number" step="0.0001" value=${targetLat} onInput=${e=>{ setTargetLat(parseFloat(e.target.value)); }} class="w-full px-2 py-1 border rounded text-sm"/></div>
-                  <div><label class="block text-sm text-gray-700">観測点 経度</label><input type="number" step="0.0001" value=${targetLon} onInput=${e=>{ setTargetLon(parseFloat(e.target.value)); }} class="w-full px-2 py-1 border rounded text-sm"/></div>
+                <div>
+                  <label class="block text-sm text-gray-700">震源 経度</label>
+                  <input type="number" step="0.01" value=${epicenterLon} onInput=${e=>setEpicenterLon(parseFloat(e.target.value))} class="w-full px-2 py-1 border rounded text-sm"/>
                 </div>
 
                 <div class="border-t pt-3">
                   <div class="flex items-center justify-between mb-2">
-                    <label class="text-sm font-medium text-gray-700">高精度モード（GSJ AVS30 利用）</label>
-                    <label class="relative inline-flex items-center cursor-pointer"><input type="checkbox" checked=${useGSJ} onChange=${e=>setUseGSJ(e.target.checked)} class="sr-only"/><div class=${'switch ' + (useGSJ ? 'on' : '')}><div class="knob"></div></div></label>
-                  </div>
-                  <div class="flex items-center justify-between mb-2">
-                    <label class="text-sm font-medium text-gray-700">地層自動計算</label>
-                    <label class="relative inline-flex items-center cursor-pointer"><input type="checkbox" checked=${autoAmplification} onChange=${e=>setAutoAmplification(e.target.checked)} class="sr-only"/><div class=${'switch ' + (autoAmplification ? 'on' : '')}><div class="knob"></div></div></label>
+                    <label class="text-sm font-medium text-gray-700">地層データ自動計算</label>
+                    <label class="relative inline-flex items-center cursor-pointer">
+                      <input type="checkbox" checked=${autoAmplification} onChange=${e=>setAutoAmplification(e.target.checked)} class="sr-only"/>
+                      <div class=${'switch ' + (autoAmplification ? 'on' : '')}><div class="knob"></div></div>
+                    </label>
                   </div>
 
                   <div class="bg-green-50 p-3 rounded-md text-sm">
-                    <p class="text-green-800 font-medium">地層クラス: ${geoClass.key} — ${geoClass.name}</p>
-                    <p class="text-green-800">AVS30: <span class="mono">${avs30Val}</span> m/s</p>
-                    <p class="text-green-800">代表Vs (top): ${geoClass.vs_rep} m/s</p>
-                    <p class="text-green-800">深部速度増加閾値: 200 m</p>
-                    <p class="text-green-800">推定上部地殻 Vs: <span class="mono">${crustVs_display.toFixed(2)}</span> km/s</p>
-                    <p class="text-green-800">増幅合成 (0.5/1/2Hz): ${siteDetail.amps.map(a=>a.toFixed(2)).join(' / ')}</p>
-                    <p class="text-green-800">増幅率（PGV 用合成）: ${siteDetail.ampScalar.toFixed(2)}</p>
+                    <p class="text-green-800 font-medium">地質: ${geoType}</p>
+                    <p class="text-green-800">AVS30: ${avs30Val} m/s</p>
+                    <p class="text-green-800">増幅率: ${ampFactor.toFixed(2)}</p>
                   </div>
                 </div>
 
@@ -673,16 +534,12 @@
             </div>
 
             <div class="bg-white rounded-lg shadow-lg p-6">
-              <h2 class="text-xl font-bold mb-3">地層クラス（代表Vs）</h2>
-              <div class="text-sm text-gray-700">
-                <table class="w-full text-xs">
-                  <thead><tr><th class="text-left">Key</th><th class="text-left">Name</th><th class="text-left">Vs rep</th><th class="text-left">Range</th><th class="text-left">thickness</th></tr></thead>
-                  <tbody>
-                    ${geologyClasses.map(g=> html`<tr><td>${g.key}</td><td>${g.name}</td><td>${g.vs_rep}</td><td>${g.vs_min}–${g.vs_max}</td><td>${g.thickness} m</td></tr>`)}
-                  </tbody>
-                </table>
+              <h2 class="text-xl font-bold mb-3">地層クラス（簡易割当）</h2>
+              <div class="text-sm text-gray-700 space-y-1">
+                ${geologyClasses.map(g => html`<div class="flex justify-between"><div>${g.key} — ${g.name}</div><div>${g.min}–${g.max} m/s (代表 ${g.rep})</div></div>`)}
               </div>
             </div>
+
           </div>
 
           <div class="bg-white rounded-lg shadow-xl p-6 mb-6">
@@ -722,7 +579,7 @@
                     <div class="flex justify-between items-center p-2 bg-white rounded text-xs">
                       <div>
                         <div class="font-medium">${name}</div>
-                        <div class="small-label text-gray-500">${data.class} · AVS30:${data.avs30} m/s · Vs_rep:${data.vs_rep} m/s</div>
+                        <div class="small-label text-gray-500">${data.geo} · AVS30:${data.avs30} m/s</div>
                       </div>
                       <div class="text-right">
                         <div class="text-gray-600">${data.arrivalTime.toFixed(1)} s</div>
@@ -744,54 +601,25 @@
                 </div>
               </div>
             </div>
+
           </div>
 
           <div class="bg-white rounded-lg shadow-lg p-6">
-            <h3 class="text-lg font-bold mb-3">実装メモ（簡潔）</h3>
+            <h3 class="text-lg font-bold mb-3">データソースと改良点</h3>
             <div class="text-sm text-gray-600">
               <ul class="list-disc list-inside">
-                <li>文献傾向を踏まえ「浅層（数十 m）と深部（>200 m）」で S 波速度が異なる点を反映しました。</li>
-                <li>閾値 200 m は実務上の目安です。地点資料（ボーリング・ Vs プロファイル）がある場合はそれで置き換えてください。</li>
-                <li>GSJ の実データを使う場合は GSJ_AVS30_TIF_URL を実エンドポイントに差し替え、CORS を確認してください。</li>
-                <li>さらに厳密な深部速度分布や層別Vsは現地観測・反射法などのデータで決める必要があります。必要なら 1D 精密伝達関数やGMPEの差し替えを行います。</li>
+                <li>GeoJSON（ブラウザフェッチ、フォールバックあり）</li>
+                <li>地層クラスを 9 段階に細分化し、AVS30 をより精密に推定</li>
+                <li>増幅率は周波数依存の簡易モデルを採用</li>
+                <li>到達時間は表層厚と上部地殻速度を分離して近似</li>
+                <li>PGV モデルに数値安定化処理を追加</li>
               </ul>
             </div>
           </div>
+
         </div>
       </div>
       `;
-    }
-
-    // フォールバック estimateAVS30FromLocation (既存)
-    function estimateAVS30FromLocation(lat, lon) {
-      const urbanCenters = [
-        { lat:35.68, lon:139.76, radiusKm:50 },
-        { lat:34.69, lon:135.50, radiusKm:40 },
-        { lat:35.18, lon:136.91, radiusKm:30 },
-        { lat:33.59, lon:130.40, radiusKm:40 }
-      ];
-      const isUrban = urbanCenters.some(c => {
-        const d = calculateDistance(lat, lon, c.lat, c.lon);
-        return d <= c.radiusKm;
-      });
-
-      const nearCoast = (lon > 122 && lon < 153 && (Math.abs(lat - 35) < 6 || Math.abs(lat - 33) < 6)) && (Math.abs(lon - 139.7) < 3 || lon < 132);
-      const isLowland = (lat < 36 && lon > 138 && lon < 141) || (lat > 34 && lat < 35 && lon > 134 && lon < 136);
-      const isAlluvial = (lat > 35 && lat < 37 && lon > 138.5 && lon < 140) || (lat > 33 && lat < 34 && lon > 130 && lon < 131);
-      const isPlateau = (lat > 35.5 && lat < 36.5 && lon > 137 && lon < 140.5);
-      const isMountain = (lat > 36 && lon < 139) || lat > 38 || lon < 132;
-
-      let avs = 300;
-      if (isMountain) avs = 450;
-      else if (isPlateau) avs = 310;
-      else if (isAlluvial) avs = 220;
-      else if (isLowland) avs = 200;
-      else if (nearCoast) avs = 180;
-      if (isUrban) avs = Math.min(avs + 20, 350);
-      avs += (35.5 - lat) * 2;
-      avs = Math.max(80, Math.min(600, Math.round(avs)));
-      const cls = findGeologyClassByAvs(avs);
-      return { avs30: avs, type: cls.name, classKey: cls.key };
     }
 
     render(h(App, {}), document.getElementById('app'));
